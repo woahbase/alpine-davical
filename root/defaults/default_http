@@ -1,0 +1,57 @@
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+
+    root WEBDIR/davical/htdocs;
+    index index.html index.htm index.php;
+
+    server_name _http;
+
+    charset utf-8;
+
+    error_page 500 502 503 504  /50x.html;
+    location = /50x.html { root   /var/lib/nginx/html; }
+
+    client_max_body_size 0;
+    keepalive_timeout 0;
+
+    location / { try_files $uri $uri/ /index.php?$args =404; }
+
+    location /images/ { }
+
+    location = / { return 301 /caldav.php$1; }
+    location = /.well-known/carddav { return 301 $scheme://$host/principals/users; }
+    location = /.well-known/caldav { return 301 $scheme://$host/principals/users; }
+
+    location ~ ^(.+\.php)(.*)$ {
+        # Prevents autofixing of path which could be used for exploit
+        try_files $uri = 404;
+        fastcgi_split_path_info ^(.+\.php)(.*)$;
+        fastcgi_pass unix:/var/run/php-fpm.sock;
+        fastcgi_index index.php;
+        include NGINX_FASTCGI_PARAMSFILE;
+
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param PATH_INFO $fastcgi_path_info;
+        fastcgi_param PATH_TRANSLATED $document_root$fastcgi_path_info;
+        fastcgi_read_timeout 180;
+        fastcgi_buffers 4 256k;
+        fastcgi_buffer_size 128k;
+    }
+
+    location ~ \.php {
+        # Prevents autofixing of path which could be used for exploit
+        try_files $uri = 404;
+        fastcgi_split_path_info ^(.+\.php)(/.+)$;
+        fastcgi_pass unix:/var/run/php-fpm.sock;
+        fastcgi_index index.php;
+        include NGINX_FASTCGI_PARAMSFILE;
+
+        fastcgi_read_timeout 180;
+        fastcgi_buffers 4 256k;
+        fastcgi_buffer_size 128k;
+    }
+
+    # Prevent access to . files (excent the well-known directory)
+    location ~ /\.(?!well-known) { deny all; }
+}

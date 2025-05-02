@@ -1,0 +1,275 @@
+#!/usr/bin/with-contenv bash
+# # reference:
+# #   https://gitlab.com/fintechstudios/davical-docker/-/blob/main/bin/run-migrations
+# #   https://github.com/Elrondo46/davical-docker-standalone/blob/main/docker-entrypoint.sh
+set -e
+
+vecho () { if [ "${S6_VERBOSITY:-1}" -gt 0 ]; then echo "[$0] $@"; fi; }
+
+# application specific configurations
+
+ROOTDIR="${ROOTDIR:-/config}";
+WEBDIR="${WEBDIR:-$ROOTDIR/www}"
+
+# source files from Dockerfile
+AWL_DEST="${WEBDIR}/awl";
+DAVI_DEST="${WEBDIR}/davical";
+
+# required always database address/port
+PGHOST="${PGHOST:-localhost}";
+PGPORT="${PGPORT:-5432}";
+
+# required for basic config
+DAVI_DATABASE="${DAVI_DATABASE:-davical}";
+DAVI_HOSTNAME="${DAVI_HOSTNAME:-localhost}";
+DAVI_ADMMAIL="${DAVI_ADMMAIL:-calendar-admin@${DAVI_HOSTNAME}}";
+DAVI_APPUSER="${DAVI_APPUSER:-davical_app}";
+# DAVI_APPPASS="${DAVI_APPPASS:-insecurebydefault}"; # unset by default, required to connect to database
+DAVI_LOCALE="${DAVI_LOCALE:-en_US}";
+DAVI_SYSTNAME="${DAVI_SYSTNAME:-DAViCal CalDAV Server}";
+
+# required during initialization, and for migrations
+DAVI_DBAUSER="${DAVI_DBAUSER:-davical_dba}";
+# DAVI_DBAPASS="${DAVI_DBAPASS:-insecurebydefault}"; # unset by default
+DAVI_SCHEMA="${DAVI_SCHEMA:-${DAVI_DBAUSER}}";
+
+# required to update default webadmin credentials
+WEBADMIN="${WEBADMIN:-admin}";
+# PASSWORD="${PASSWORD:-nimda}"; # unset by default
+
+# required only for create-database
+# unset afterwards to fallback to DAVI_APPUSER (for pg_isready)
+# so we don't need to expose POSTGRES_* credentials on subsequent runs
+POSTGRES_USER="${POSTGRES_USER:-${DAVI_APPUSER}}";
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-${DAVI_APPPASS}}";
+
+# create our directories
+vecho "Ensure project/configuration directories.";
+mkdir -p  \
+    "${AWL_DEST}" \
+    "${DAVI_DEST}" \
+    "/etc/davical" \
+    ;
+
+if [ ! -e "${AWL_DEST}/VERSION" ];
+then
+    vecho "Unpacking AWL r$(cat /opt/davical/awlversion) at ${AWL_DEST}";
+    tar -xzf "${AWL_SRC}" \
+        -C "${AWL_DEST}" \
+        --strip-components=1;
+    rm -rf \
+        "${AWL_DEST}/tests" \
+        "${AWL_DEST}/docs" \
+        ;
+    vecho "Done.";
+fi
+
+if [ ! -e "${DAVI_DEST}/VERSION" ];
+then
+    vecho "Unpacking DAViCal r$(cat /opt/davical/version) at ${DAVI_DEST}";
+    tar -xzf "${DAVI_SRC}" \
+        -C "${DAVI_DEST}" \
+        --strip-components=1;
+    rm -rf \
+        "${DAVI_DEST}/testing" \
+        "${DAVI_DEST}/docs" \
+        ;
+    vecho "Done.";
+fi
+
+# to ensure MAXIMUM script compatibility
+# e.g. admin-pass setting not working otherwise
+if [ "${WEBDIR}" != "/usr/share"* ];
+then
+    vecho "Linking project directories in /usr/share/";
+    ln -sf "${DAVI_DEST}" /usr/share/davical;
+    ln -sf "${AWL_DEST}" /usr/share/awl;
+fi;
+
+# ensure config file exists
+if [ ! -f "/etc/davical/config.php" ] \
+&& [ -f "/defaults/config.php" ]; # mount your config as this file to take advantage of faux-envsubst
+then
+    vecho "Setting up /etc/davical/config.php (from /defaults/config.php)";
+    _subst () { # these variables are substituted in config.php
+        sed \
+        -e "s|DAVI_APPPASS|${DAVI_APPPASS}|g" \
+        -e "s|DAVI_APPUSER|${DAVI_APPUSER}|g" \
+        -e "s|DAVI_DATABASE|${DAVI_DATABASE}|g" \
+        -e "s|DAVI_ADMMAIL|${DAVI_ADMMAIL}|g" \
+        -e "s|DAVI_HOSTNAME|${DAVI_HOSTNAME}|g" \
+        -e "s|DAVI_LOCALE|${DAVI_LOCALE}|g" \
+        -e "s|DAVI_SYSTNAME|${DAVI_SYSTNAME}|g" \
+        -e "s|PGHOST|${PGHOST}|g" \
+        -e "s|PGPORT|${PGPORT}|g" \
+        $1 > $2;
+    }
+    _subst /defaults/config.php /etc/davical/config.php;
+fi;
+
+# fix permissions
+if [ -z "${DAVI_SKIP_PERMFIX}" ]; # set to 'true' to skip running on every startup
+then
+    vecho "Fixing permissions.";
+    find "${AWL_DEST}" "${DAVI_DEST}" "/etc/davical" \
+        \! -user ${S6_USER:-alpine} -exec \
+        chown --no-dereference \
+        ${S6_USER:-alpine}:${PGID:-1000} \
+        '{}' +;
+
+    # fix sub-dir/file permissions
+    find "${AWL_DEST}" -type d -exec chmod u=rwx,g=rx,o=rx '{}' +;
+    find "${AWL_DEST}" -type f -exec chmod u=rw,g=r,o=r '{}' +;
+    # find "${AWL_DEST}" -type f -name *.sh -exec chmod u=rwx,g=r,o=rx '{}' +;
+    find "${AWL_DEST}" -type f -name *.sh -exec chmod u=rwx,g=rx,o=r '{}' +;
+
+    find "${DAVI_DEST}" -type d -exec chmod u=rwx,g=rx,o=rx '{}' +;
+    find "${DAVI_DEST}" -type f -exec chmod u=rw,g=r,o=r '{}' +;
+    find "${DAVI_DEST}" -type f -name *.php -exec chmod u=rwx,g=rx,o=r '{}' +;
+    find "${DAVI_DEST}" -type f -name *.sh -exec chmod u=rwx,g=r,o=rx '{}' +;
+
+    # fix script permissions
+    chmod u=rwx,g=r,o=rx \
+        "${DAVI_DEST}/dba/create-database.sh" \
+        "${DAVI_DEST}/dba/update-davical-database" \
+        "${DAVI_DEST}/scripts/davical-cli" \
+        ;
+fi;
+
+if [ -n "${DAVI_SKIP_DBSETUP}" ]; then exit 0; fi; # set to 'true' to skip touching database at all
+# useful if you mount your own config.php, and don't need database modifications or readiness check
+
+export PGHOST="${PGHOST}";
+export PGPORT="${PGPORT}";
+export PGUSER="${POSTGRES_USER}";
+export PGPASSWORD="${POSTGRES_PASSWORD}";
+if [ "${POSTGRES_USER}" = "${DAVI_APPUSER}" ];
+then # expect davical database is already initialized
+    # hence exists, and DAVI_APPUSER is permitted to
+    # check for its existence
+    export PGDATABASE="${PGDATABASE:-${DAVI_DATABASE}}";
+else # expect davical database may not be existing yet
+    export PGDATABASE="${PGDATABASE:-postgres}";
+fi;
+# block until database ready
+vecho "Waiting for Postgresql (database \"${PGDATABASE}\", as user ${PGUSER})";
+ret=6; # wait for upto 5x6=30 seconds
+until pg_isready -d "${PGDATABASE}" -h "${PGHOST}" -t 1;
+do
+    if [[ ret -eq 0 ]];
+    then
+        vecho "Could not connect to Postgresql (database \"${PGDATABASE}\"). Exiting.";
+        exit 1;
+    fi;
+    sleep 5;
+    ((ret--));
+done;
+vecho "Found Postgresql (database \"${PGDATABASE}\")";
+
+if ! `psql -qXl | grep -q "${DAVI_DATABASE}"`;
+then
+    # vecho "Run /usr/share/davical/dba/create-database.sh.";
+    # # can't get this to work
+    # /usr/share/davical/dba/create-database.sh \
+    #     "${DAVI_DATABASE}" \
+    #     "${DAVI_DBAPASS}" \
+    #     "${DAVI_DBAUSER}" \
+    #     "${DAVI_APPUSER}";
+    # # instead
+    vecho "Ensure database \"${DAVI_DATABASE}\" and user(s) initialized.";
+    psql -qX \
+        -v newdb="${DAVI_DATABASE}" \
+        -v dbaUser="${DAVI_DBAUSER}" \
+        -v dbaPass="'${DAVI_DBAPASS}'" \
+        -v appUser="${DAVI_APPUSER}" \
+        -v appPass="'${DAVI_APPPASS}'" \
+        -v schema="${DAVI_SCHEMA}" \
+    <<-EOSQL
+        CREATE DATABASE :newdb;
+        CREATE ROLE :dbaUser WITH LOGIN ENCRYPTED PASSWORD :dbaPass;
+        CREATE ROLE :appUser WITH LOGIN ENCRYPTED PASSWORD :appPass;
+        GRANT ALL PRIVILEGES ON DATABASE :newdb TO :dbaUser;
+        ALTER DATABASE :newdb OWNER TO :dbaUser;
+
+        \connect :newdb
+        CREATE SCHEMA :schema AUTHORIZATION :dbaUser;
+        ALTER ROLE :dbaUser SET search_path TO :schema;
+        ALTER ROLE :appUser SET search_path TO :schema;
+        GRANT USAGE ON SCHEMA :schema TO :appUser;
+EOSQL
+
+    # switch user/pass to DAVI_DBAUSER and database for davical
+    export PGUSER="${DAVI_DBAUSER}";
+    export PGPASSWORD="${DAVI_DBAPASS}";
+    export PGDATABASE="${DAVI_DATABASE}";
+
+    vecho "Run tasks from /usr/share/davical/dba/create-database.sh";
+    vecho "Instead of running the script itself.";
+    # load default tables/schema etc
+    psql -qXAt -f /usr/share/awl/dba/awl-tables.sql;
+    psql -qXAt -f /usr/share/awl/dba/schema-management.sql;
+    psql -qXAt -f /usr/share/davical/dba/davical.sql;
+    # run migrations at this point
+    vecho "Running /usr/share/davical/dba/update-davical-database.";
+    vecho "Which should automatically apply any necessary database migrations.";
+    /usr/share/davical/dba/update-davical-database \
+        --dbname "${DAVI_DATABASE}" \
+        --dbuser "${DAVI_DBAUSER}" \
+        --dbhost "${PGHOST}" \
+        --dbpass "${DAVI_DBAPASS}" \
+        --appuser "${DAVI_APPUSER}" \
+        --owner "${DAVI_DBAUSER}" \
+        ;
+    # load default data
+    psql -qXAt -f /usr/share/davical/dba/base-data.sql;
+    vecho "Database \"${DAVI_DATABASE}\" initialization complete.";
+else
+
+    vecho "Database \"${DAVI_DATABASE}\" exists. Skipping initialization.";
+
+    if [ -z "${DAVI_SKIP_MIGRATION}" ]; # set to 'true' to skip running migration on every startup
+    then
+        # switch user/pass to DAVI_DBAUSER and database for davical
+        export PGUSER="${DAVI_DBAUSER}";
+        export PGPASSWORD="${DAVI_DBAPASS}";
+        export PGDATABASE="${DAVI_DATABASE}";
+
+        # ONLY run migrations at this point
+        vecho "Running ${DAVI_DEST}/dba/update-davical-database";
+        vecho "Which should automatically apply any necessary migrations.";
+        /usr/share/davical/dba/update-davical-database \
+            --dbname "${DAVI_DATABASE}" \
+            --dbuser "${DAVI_DBAUSER}" \
+            --dbhost "${PGHOST}" \
+            --dbpass "${DAVI_DBAPASS}" \
+            --appuser "${DAVI_APPUSER}" \
+            --owner "${DAVI_DBAUSER}" \
+            ;
+        vecho "Database \"${DAVI_DATABASE}\" migration complete.";
+    fi;
+fi;
+
+# DAViCal only uses salted SHA1 at-best, but it's better than storing the password in plaintext!
+# see https://wiki.davical.org/index.php?title=Force_Admin_Password
+# from https://gitlab.com/davical-project/awl/-/blob/3f044e2dc8435c2eeba61a3c41ec11c820711ab3/inc/DataUpdate.php#L48-58
+if [ -n "${WEBADMIN}" ] \
+&& [ -n "${PASSWORD}" ]; # change the default webadmin credentials to something better
+then
+    # switch user/pass to DAVI_DBAUSER and database for davical
+    export PGUSER="${DAVI_DBAUSER}";
+    export PGPASSWORD="${DAVI_DBAPASS}";
+    export PGDATABASE="${DAVI_DATABASE}";
+
+    # # this don't work
+    # passSalted=$(php -r "require '${AWL_DEST}/inc/AWLUtilities.php'; echo session_salted_sha1($argv[1]);" "${PASSWORD}" 2>/dev/null);
+    # # but this does
+    passSalted=$(php -r 'require "/usr/share/awl/inc/AWLUtilities.php"; echo session_salted_sha1($argv[1]);' "${PASSWORD}" 2>/dev/null);
+    psql -qX \
+        -v an="'${WEBADMIN}'" \
+        -v pw="'${passSalted}'" \
+    <<-EOSQL
+        UPDATE usr SET password = :pw WHERE user_no = 1;
+        UPDATE usr SET username = :an WHERE user_no = 1;
+EOSQL
+    vecho "Updated login password for admin: ${WEBADMIN}"; # ":${PASSWORD} => ${passSalted}";
+fi;
