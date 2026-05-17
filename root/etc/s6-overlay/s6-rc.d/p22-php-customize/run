@@ -79,7 +79,8 @@ fi
 
 # to ensure MAXIMUM script compatibility
 # e.g. admin-pass setting not working otherwise
-if [ "${WEBDIR}" != "/usr/share"* ];
+if [ "${WEBDIR}" != "/usr/share"* ] \
+&& [ "X${EUID}" == "X0" ]; # requires root
 then
     vecho "Linking project directories in /usr/share/";
     ln -sf "${DAVI_DEST}" /usr/share/davical;
@@ -108,7 +109,8 @@ then
 fi;
 
 # fix permissions
-if [ -z "${DAVI_SKIP_PERMFIX}" ]; # set to 'true' to skip running on every startup
+if [ -z "${DAVI_SKIP_PERMFIX}" ] \
+&& [ "X${EUID}" == "X0" ]; # requires root ; # set to 'true' to skip running on every startup
 then
     vecho "Fixing permissions.";
     find "${AWL_DEST}" "${DAVI_DEST}" "/etc/davical" \
